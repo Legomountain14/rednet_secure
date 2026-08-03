@@ -42,18 +42,26 @@ protocol using [`rednet.lookup`].
 
 @module rednet
 @since 1.2
-@see rednet_message Queued when a rednet message is received.
+@see shrednet_message Queued when a rednet message is received.
 @see modem Rednet is built on top of the modem peripheral. Modems provide a more
 bare-bones but flexible interface.
 ]]
 
+
+local blake2s   = require("crypto.blake2s.blake2s");
+local x25519    = require("crypto.x25519.x25519");
+local ChaCha20  = require("crypto.chacha20.chacha20");
+local Rng       = require("crypto.chacha20.chacha20rng");
+local base64    = require("util.base64.base64");
+local hkdf      = require("crypto.hkdf");
+local randutils = require("randutils")
 local expect = dofile("rom/modules/main/cc/expect.lua").expect
 
 --- The channel used by the Rednet API to [`broadcast`] messages.
 CHANNEL_BROADCAST = 65535
 
---- The channel used to broadcast the public keys
-CHANNEL_PUBKEY = 65530
+--- The channel used to share public keys
+CHANNEL_PUBKEY = 65535
 
 --- The channel used by the Rednet API to repeat messages.
 CHANNEL_REPEAT = 65533
@@ -69,6 +77,90 @@ local prune_received_timer
 local function id_as_channel(id)
     return (id or os.getComputerID()) % MAX_ID_CHANNELS
 end
+
+
+
+
+
+
+
+-- 32 bytes for use as a private key
+local local_private = "9e98b26b6cb95b1cf4cec1b783a3e673"
+
+-- Compute local public key
+local local_public = x25519.get_public_key(local_private);
+
+
+
+local function table_contains(table, input)
+    local contains = false
+    for k, v in pairs(table) do
+        if v == input then
+            contains = true
+        end
+    end
+    if contains then
+        return true
+    else
+        return false
+    end
+end
+
+
+local function readKeyFile()
+    if fs.exists("keys.shrednet") then
+        local file = fs.open("keys.shrednet", "r")
+        local contents = file.readAll()
+        file.close()
+        return textutils.unserialise(contents)
+    end
+    return {}
+end
+
+local function writeKeyFile(keys)
+    local handle, err = fs.open("keys.shrednet", "w")
+    if not handle then error(err, 2) end
+
+    handle.write(textutils.serialise(keys))
+    handle.close()
+end
+
+
+
+
+
+
+function sendPublicKey()
+    expect(2, protocol, "string", "nil")
+    print("Private key: " .. base64.encode(local_private));
+    print("Public key : " .. base64.encode(local_public));
+    while true do
+        send(CHANNEL_PUBKEY, local_public, "shrednet_public_key")
+        sleep(2)
+    end
+end
+
+function receivePublicKey()
+    local receivedPublicKey = ""
+    while true do
+        local keys = readKeyFile()
+        id, receivedPublicKey = receive("shrednet_public_key")
+        if not table_contains(keys, base64.encode(receivedPublicKey)) then
+            print("Received new public key from computer " .. id .. ":   " .. base64.encode(receivedPublicKey))
+            table.insert(keys, base64.encode(receivedPublicKey))
+            writeKeyFile(keys)
+        else
+            print("Recived ping from computer " .. id)
+        end
+    end
+end
+
+
+
+
+
+
+
 
 --[[- Opens a modem with the given [`peripheral`] name, allowing it to send and
 receive messages over rednet.
@@ -96,8 +188,12 @@ function open(modem)
     if peripheral.getType(modem) ~= "modem" then
         error("No such modem: " .. modem, 2)
     end
+        local id = shell.openTab("share_keys")
+        print(id)
+        multishell.setTitle(id, "open")
     peripheral.call(modem, "open", id_as_channel())
     peripheral.call(modem, "open", CHANNEL_BROADCAST)
+    peripheral.call(modem, "open", CHANNEL_PUBKEY)
 end
 
 --- Close a modem with the given [`peripheral`] name, meaning it can no longer
@@ -116,6 +212,8 @@ function close(modem)
         end
         peripheral.call(modem, "close", id_as_channel())
         peripheral.call(modem, "close", CHANNEL_BROADCAST)
+        peripheral.call(modem, "close", CHANNEL_PUBKEY)
+        os.queueEvent("shrednet_close", true)
     else
         -- Close all modems
         for _, modem in ipairs(peripheral.getNames()) do
@@ -138,7 +236,7 @@ function isOpen(modem)
     if modem then
         -- Check if a specific modem is open
         if peripheral.getType(modem) == "modem" then
-            return peripheral.call(modem, "isOpen", id_as_channel()) and peripheral.call(modem, "isOpen", CHANNEL_BROADCAST)
+            return peripheral.call(modem, "isOpen", id_as_channel()) and peripheral.call(modem, "isOpen", CHANNEL_BROADCAST) and peripheral.call(modem, "isOpen", CHANNEL_PUBKEY)
         end
     else
         -- Check if any modem is open
@@ -199,12 +297,13 @@ function send(recipient, message, protocol)
     local sent = false
     if recipient == os.getComputerID() then
         -- Loopback to ourselves
-        os.queueEvent("rednet_message", os.getComputerID(), message, protocol)
+        os.queueEvent("shrednet_message", os.getComputerID(), message, protocol)
         sent = true
     else
         -- Send on all open modems, to the target and to repeaters
-        if recipient ~= CHANNEL_BROADCAST then
+        if recipient ~= CHANNEL_BROADCAST and recipient ~= CHANNEL_PUBKEY then
             recipient = id_as_channel(recipient)
+            print("sending to computer" .. recipient)
         end
 
         for _, modem in ipairs(peripheral.getNames()) do
@@ -291,14 +390,14 @@ function receive(protocol_filter, timeout)
         timer = os.startTimer(timeout)
         event_filter = nil
     else
-        event_filter = "rednet_message"
+        event_filter = "shrednet_message"
     end
 
     -- Wait for events
     while true do
         local event, p1, p2, p3 = os.pullEvent(event_filter)
-        if event == "rednet_message" then
-            -- Return the first matching rednet_message
+        if event == "shrednet_message" then
+            -- Return the first matching shrednet_message
             local sender_id, message, protocol = p1, p2, p3
             if protocol_filter == nil or protocol == protocol_filter then
                 if timer then os.cancelTimer(timer) end
@@ -431,7 +530,7 @@ function lookup(protocol, hostname, timeout)
     -- Wait for events
     while true do
         local event, p1, p2, p3 = os.pullEvent()
-        if event == "rednet_message" then
+        if event == "shrednet_message" then
             -- Got a rednet message, check if it's the response to our request
             local sender_id, message, message_protocol = p1, p2, p3
             if message_protocol == "dns" and type(message) == "table" and message.sType == "lookup response" then
@@ -467,7 +566,7 @@ local started = false
 -- should not be called manually.
 function run()
     if started then
-        error("rednet is already running", 2)
+        error("shrednet is already running", 2)
     end
     started = true
 
@@ -485,11 +584,11 @@ function run()
                 then
                     received_messages[message.nMessageID] = os.clock() + 9.5
                     if not prune_received_timer then prune_received_timer = os.startTimer(10) end
-                    os.queueEvent("rednet_message", message.nSender or reply_channel, message.message, message.sProtocol)
+                    os.queueEvent("shrednet_message", message.nSender or reply_channel, message.message, message.sProtocol)
                 end
             end
 
-        elseif event == "rednet_message" then
+        elseif event == "shrednet_message" then
             -- Got a rednet message (queued from above), respond to dns lookup
             local sender, message, protocol = p1, p2, p3
             if protocol == "dns" and type(message) == "table" and message.sType == "lookup" then
@@ -515,3 +614,20 @@ function run()
         end
     end
 end
+
+
+
+return {
+    sendPublicKey = sendPublicKey,
+    receivePublicKey = receivePublicKey,
+    open = open,
+    close = close,
+    isOpen = isOpen,
+    send = send,
+    broadcast = broadcast,
+    receive = receive,
+    host = host,
+    unhost = unhost,
+    lookup = lookup,
+    run = run
+}
