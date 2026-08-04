@@ -42,7 +42,7 @@ protocol using [`rednet.lookup`].
 
 @module rednet
 @since 1.2
-@see shrednet_message Queued when a rednet message is received.
+@see rednet_secure_message Queued when a rednet message is received.
 @see modem Rednet is built on top of the modem peripheral. Modems provide a more
 bare-bones but flexible interface.
 ]]
@@ -51,17 +51,15 @@ bare-bones but flexible interface.
 local blake2s   = require("crypto.blake2s.blake2s");
 local x25519    = require("crypto.x25519.x25519");
 local ChaCha20  = require("crypto.chacha20.chacha20");
-local Rng       = require("crypto.chacha20.chacha20rng");
 local base64    = require("util.base64.base64");
 local hkdf      = require("crypto.hkdf");
-local randutils = require("randutils")
 local expect = dofile("rom/modules/main/cc/expect.lua").expect
 
 --- The channel used by the Rednet API to [`broadcast`] messages.
 CHANNEL_BROADCAST = 65535
 
 --- The channel used to share public keys
-CHANNEL_PUBKEY = 65535
+CHANNEL_PUBKEY = 65530
 
 --- The channel used by the Rednet API to repeat messages.
 CHANNEL_REPEAT = 65533
@@ -81,11 +79,19 @@ end
 
 
 
-
+local function readPrivatekey()
+    if fs.exists(".rednet_secure_privatekey") then
+        local file = fs.open(".rednet_secure_privatekey", "r")
+        local contents = file.readLine()
+        file.close()
+        return contents
+    end
+    error("Private key not found. Please generate a private key with 'openssl rand -hex 16' and place it in '/.rednet_secure_privatekey'")
+end
 
 
 -- 32 bytes for use as a private key
-local local_private = "9e98b26b6cb95b1cf4cec1b783a3e673"
+local local_private = readPrivatekey()
 
 -- Compute local public key
 local local_public = x25519.get_public_key(local_private);
@@ -106,19 +112,8 @@ local function table_contains(table, input)
     end
 end
 
-
-local function readKeyFile()
-    if fs.exists("keys.shrednet") then
-        local file = fs.open("keys.shrednet", "r")
-        local contents = file.readAll()
-        file.close()
-        return textutils.unserialise(contents)
-    end
-    return {}
-end
-
 local function writeKeyFile(keys)
-    local handle, err = fs.open("keys.shrednet", "w")
+    local handle, err = fs.open(".rednet_secure_keystore", "w")
     if not handle then error(err, 2) end
 
     handle.write(textutils.serialise(keys))
@@ -126,7 +121,26 @@ local function writeKeyFile(keys)
 end
 
 
+local function readKeyStore()
+    if fs.exists(".rednet_secure_keystore") then
+        local file = fs.open(".rednet_secure_keystore", "r")
+        local contents = file.readAll()
+        file.close()
+        return textutils.unserialise(contents)
+    end
+    writeKeyFile({})
+    error(".rednet_secure_keystore does not exist.")
+end
 
+
+local function getKeyFromStore(id)
+    local keyStore = readKeyStore()
+    if keyStore[id] ~= nil then
+        return base64.decode(keyStore[id])
+    else
+        error("Requested key " .. id .. " not in store.")
+    end
+end
 
 
 
@@ -135,7 +149,7 @@ function sendPublicKey()
     print("Private key: " .. base64.encode(local_private));
     print("Public key : " .. base64.encode(local_public));
     while true do
-        send(CHANNEL_PUBKEY, local_public, "shrednet_public_key")
+        send(CHANNEL_PUBKEY, local_public, "rednet_secure_public_key", false)
         sleep(2)
     end
 end
@@ -143,11 +157,11 @@ end
 function receivePublicKey()
     local receivedPublicKey = ""
     while true do
-        local keys = readKeyFile()
-        id, receivedPublicKey = receive("shrednet_public_key")
+        local keys = readKeyStore()
+        id, receivedPublicKey = receive("rednet_secure_public_key")
         if not table_contains(keys, base64.encode(receivedPublicKey)) then
             print("Received new public key from computer " .. id .. ":   " .. base64.encode(receivedPublicKey))
-            table.insert(keys, base64.encode(receivedPublicKey))
+            keys[id] = base64.encode(receivedPublicKey)
             writeKeyFile(keys)
         else
             print("Recived ping from computer " .. id)
@@ -189,7 +203,6 @@ function open(modem)
         error("No such modem: " .. modem, 2)
     end
         local id = shell.openTab("share_keys")
-        print(id)
         multishell.setTitle(id, "open")
     peripheral.call(modem, "open", id_as_channel())
     peripheral.call(modem, "open", CHANNEL_BROADCAST)
@@ -213,7 +226,7 @@ function close(modem)
         peripheral.call(modem, "close", id_as_channel())
         peripheral.call(modem, "close", CHANNEL_BROADCAST)
         peripheral.call(modem, "close", CHANNEL_PUBKEY)
-        os.queueEvent("shrednet_close", true)
+        os.queueEvent("rednet_secure_close", true)
     else
         -- Close all modems
         for _, modem in ipairs(peripheral.getNames()) do
@@ -274,7 +287,8 @@ actually _received_.
 
     rednet.send(2, "Hello from rednet!")
 ]]
-function send(recipient, message, protocol)
+function send(recipient, message, protocol, encrypted)
+    if encrypted == nil then encrypted = true end
     expect(1, recipient, "number")
     expect(3, protocol, "string", "nil")
     -- Generate a (probably) unique message ID
@@ -284,6 +298,25 @@ function send(recipient, message, protocol)
     received_messages[message_id] = os.clock() + 9.5
     if not prune_received_timer then prune_received_timer = os.startTimer(10) end
 
+
+    if encrypted and recipient <= MAX_ID_CHANNELS then
+        local recipient_public = getKeyFromStore(recipient)
+        local shared_secret = x25519.get_shared_secret(local_private, recipient_public);
+
+        local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab4774284a3f5937bf77cf67713f349a8583905094865306c1fbb66c10bcfb089a932a297f1ed69965754d72078225cb8e6f34931303af0010e5d048680f076111d30ae449a325355ad3400190b664935bc0f9d2ab4e5468f6d97b928473b5fe2254d21b5fb"        local session_info = "ChaCha20 session key";
+        local session_key = hkdf.derive(shared_secret, hkdf_salt, session_info, 32);
+        local nonce = hkdf.derive(shared_secret, hkdf_salt, "nonce", 12);
+        local cipher = ChaCha20.new(session_key, nonce);
+
+        local ciphertext = cipher:apply_keystream(message);
+
+        local mac_info = "BLAKE2s MAC key";
+        local mac_key = hkdf.derive(shared_secret, hkdf_salt, mac_info, 32);
+        local mac = blake2s.digest(ciphertext, mac_key);
+
+        message = nonce .. mac .. ciphertext;
+    end
+
     -- Create the message
     local reply_channel = id_as_channel()
     local message_wrapper = {
@@ -292,18 +325,18 @@ function send(recipient, message, protocol)
         nSender = os.getComputerID(),
         message = message,
         sProtocol = protocol,
+        encrypted = encrypted
     }
 
     local sent = false
     if recipient == os.getComputerID() then
         -- Loopback to ourselves
-        os.queueEvent("shrednet_message", os.getComputerID(), message, protocol)
+        os.queueEvent("rednet_secure_message", os.getComputerID(), message, protocol)
         sent = true
     else
         -- Send on all open modems, to the target and to repeaters
         if recipient ~= CHANNEL_BROADCAST and recipient ~= CHANNEL_PUBKEY then
             recipient = id_as_channel(recipient)
-            print("sending to computer" .. recipient)
         end
 
         for _, modem in ipairs(peripheral.getNames()) do
@@ -390,17 +423,43 @@ function receive(protocol_filter, timeout)
         timer = os.startTimer(timeout)
         event_filter = nil
     else
-        event_filter = "shrednet_message"
+        event_filter = "rednet_secure_message"
     end
 
     -- Wait for events
     while true do
-        local event, p1, p2, p3 = os.pullEvent(event_filter)
-        if event == "shrednet_message" then
-            -- Return the first matching shrednet_message
-            local sender_id, message, protocol = p1, p2, p3
-            if protocol_filter == nil or protocol == protocol_filter then
+        local event, p1, p2, p3, p4 = os.pullEvent(event_filter)
+        if event == "rednet_secure_message" then
+            -- Return the first matching rednet_secure_message
+            local sender_id, message, protocol, encrypted = p1, p2, p3, p4
+            if (protocol_filter == nil and protocol ~= "rednet_secure_public_key") or protocol == protocol_filter then
                 if timer then os.cancelTimer(timer) end
+
+                if (encrypted) and (sender_id <= MAX_ID_CHANNELS) then
+                    local sender_public = getKeyFromStore(sender_id)
+                    print("run")
+                    local shared_secret = x25519.get_shared_secret(local_private, sender_public);
+
+                    local received_nonce = message:sub(1, 12);   -- First 12 bytes are the nonce
+                    local received_mac = message:sub(13, 44);    -- Next 32 bytes are the MAC (BLAKE2s produces a 32-byte hash)
+                    local received_ciphertext = message:sub(45); -- The rest is the ciphertext
+
+local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab4774284a3f5937bf77cf67713f349a8583905094865306c1fbb66c10bcfb089a932a297f1ed69965754d72078225cb8e6f34931303af0010e5d048680f076111d30ae449a325355ad3400190b664935bc0f9d2ab4e5468f6d97b928473b5fe2254d21b5fb"
+
+                    local mac_info = "BLAKE2s MAC key";
+                    local mac_key = hkdf.derive(shared_secret, hkdf_salt, mac_info, 32);
+
+                    local expected_mac = blake2s.digest(received_ciphertext, mac_key);
+                    assert(received_mac == expected_mac, "MAC verification failed!");
+
+                    local session_info = "ChaCha20 session key";
+                    local session_key = hkdf.derive(shared_secret, hkdf_salt, session_info, 32);
+
+
+                    local cipher = ChaCha20.new(session_key, received_nonce);
+                    message = cipher:apply_keystream(received_ciphertext);
+                end
+
                 return sender_id, message, protocol
             end
         elseif event == "timer" then
@@ -530,7 +589,7 @@ function lookup(protocol, hostname, timeout)
     -- Wait for events
     while true do
         local event, p1, p2, p3 = os.pullEvent()
-        if event == "shrednet_message" then
+        if event == "rednet_secure_message" then
             -- Got a rednet message, check if it's the response to our request
             local sender_id, message, message_protocol = p1, p2, p3
             if message_protocol == "dns" and type(message) == "table" and message.sType == "lookup response" then
@@ -566,7 +625,7 @@ local started = false
 -- should not be called manually.
 function run()
     if started then
-        error("shrednet is already running", 2)
+        error("rednet_secure is already running", 2)
     end
     started = true
 
@@ -575,22 +634,22 @@ function run()
         if event == "modem_message" then
             -- Got a modem message, process it and add it to the rednet event queue
             local modem, channel, reply_channel, message = p1, p2, p3, p4
-            if channel == id_as_channel() or channel == CHANNEL_BROADCAST then
+            if channel == id_as_channel() or channel == CHANNEL_BROADCAST or channel == CHANNEL_PUBKEY then
                 if type(message) == "table" and type(message.nMessageID) == "number"
                     and message.nMessageID == message.nMessageID and not received_messages[message.nMessageID]
                     and (type(message.nSender) == "nil" or (type(message.nSender) == "number" and message.nSender == message.nSender))
-                    and ((message.nRecipient and message.nRecipient == os.getComputerID()) or channel == CHANNEL_BROADCAST)
+                    and ((message.nRecipient and message.nRecipient == os.getComputerID()) or channel == CHANNEL_BROADCAST or channel == CHANNEL_PUBKEY)
                     and isOpen(modem)
                 then
                     received_messages[message.nMessageID] = os.clock() + 9.5
                     if not prune_received_timer then prune_received_timer = os.startTimer(10) end
-                    os.queueEvent("shrednet_message", message.nSender or reply_channel, message.message, message.sProtocol)
+                    os.queueEvent("rednet_secure_message", message.nSender or reply_channel, message.message, message.sProtocol, message.encrypted)
                 end
             end
 
-        elseif event == "shrednet_message" then
+        elseif event == "rednet_secure_message" then
             -- Got a rednet message (queued from above), respond to dns lookup
-            local sender, message, protocol = p1, p2, p3
+            local sender, message, protocol, encrypted = p1, p2, p3, p4
             if protocol == "dns" and type(message) == "table" and message.sType == "lookup" then
                 local hostname = hostnames[message.sProtocol]
                 if hostname ~= nil and (message.sHostname == nil or message.sHostname == hostname) then

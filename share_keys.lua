@@ -1,9 +1,10 @@
-local shrednet = require("shrednet")
+local rednet_secure = require("rednet_secure")
 
-local function shrednet_close()
+local function rednet_secure_close()
     repeat
-        local _, shrednet_close = os.pullEvent("shrednet_close")
-    until shrednet_close == true
+        local _, rednet_secure_closed = os.pullEvent("rednet_secure_close")
+    until rednet_secure_closed == true
+    return
 end
 
-parallel.waitForAny(shrednet.sendPublicKey, shrednet.receivePublicKey, shrednet_close)
+parallel.waitForAny(rednet_secure.sendPublicKey, rednet_secure.receivePublicKey, rednet_secure_close)
