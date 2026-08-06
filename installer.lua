@@ -1,6 +1,7 @@
 local paths = {
   ['rednet_secure.lua'] = 'https://github.com/Legomountain14/rednet_secure/releases/latest/download/rednet_secure.lua',
   ['share_keys.lua'] = 'https://github.com/Legomountain14/rednet_secure/releases/latest/download/share_keys.lua',
+  ['randutils.lua'] = 'https://github.com/Legomountain14/rednet_secure/releases/latest/download/randutils.lua',
 
 
 
