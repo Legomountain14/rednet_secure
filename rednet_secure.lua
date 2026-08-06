@@ -54,6 +54,7 @@ local ChaCha20  = require("crypto.chacha20.chacha20");
 local base64    = require("util.base64.base64");
 local hkdf      = require("crypto.hkdf");
 local expect = dofile("rom/modules/main/cc/expect.lua").expect
+local randutils = require("randutils")
 
 --- The channel used by the Rednet API to [`broadcast`] messages.
 CHANNEL_BROADCAST = 65535
@@ -308,7 +309,7 @@ function send(recipient, message, protocol, encrypted)
         local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab4774284a3f5937bf77cf67713f349a8583905094865306c1fbb66c10bcfb089a932a297f1ed69965754d72078225cb8e6f34931303af0010e5d048680f076111d30ae449a325355ad3400190b664935bc0f9d2ab4e5468f6d97b928473b5fe2254d21b5fb"
         local session_info = "ChaCha20 session key";
         local session_key = hkdf.derive(shared_secret, hkdf_salt, session_info, 32);
-        local nonce = hkdf.derive(shared_secret, hkdf_salt, "nonce", 12);
+        local nonce = hkdf.derive(shared_secret, hkdf_salt, randutils.randomString(8), 12);
         local cipher = ChaCha20.new(session_key, nonce);
 
         local ciphertext = cipher:apply_keystream(message);
@@ -440,7 +441,6 @@ function receive(protocol_filter, timeout)
 
                 if (encrypted) and (sender_id <= MAX_ID_CHANNELS) then
                     local sender_public = getKeyFromStore(sender_id)
-                    print("run")
                     local shared_secret = x25519.get_shared_secret(local_private, sender_public);
 
                     local received_nonce = message:sub(1, 12);   -- First 12 bytes are the nonce
