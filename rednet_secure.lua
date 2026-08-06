@@ -138,7 +138,7 @@ local function getKeyFromStore(id)
     if keyStore[id] ~= nil then
         return base64.decode(keyStore[id])
     else
-        error("Requested key " .. id .. " not in store.")
+        return false
     end
 end
 
@@ -298,12 +298,15 @@ function send(recipient, message, protocol, encrypted)
     received_messages[message_id] = os.clock() + 9.5
     if not prune_received_timer then prune_received_timer = os.startTimer(10) end
 
+    if getKeyFromStore(recipient) == false and encrypted then encrypted = false; --[[print("WARNING: Due to not having the public key of the recipient, falling back to unencrypted communication.\nIt is important to always make sure your recipient's public key is in the keystore, or wait a few seconds for rednet_secure.open() to collect public keys.")]] end
+
 
     if encrypted and recipient <= MAX_ID_CHANNELS then
         local recipient_public = getKeyFromStore(recipient)
         local shared_secret = x25519.get_shared_secret(local_private, recipient_public);
 
-        local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab4774284a3f5937bf77cf67713f349a8583905094865306c1fbb66c10bcfb089a932a297f1ed69965754d72078225cb8e6f34931303af0010e5d048680f076111d30ae449a325355ad3400190b664935bc0f9d2ab4e5468f6d97b928473b5fe2254d21b5fb"        local session_info = "ChaCha20 session key";
+        local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab4774284a3f5937bf77cf67713f349a8583905094865306c1fbb66c10bcfb089a932a297f1ed69965754d72078225cb8e6f34931303af0010e5d048680f076111d30ae449a325355ad3400190b664935bc0f9d2ab4e5468f6d97b928473b5fe2254d21b5fb"
+        local session_info = "ChaCha20 session key";
         local session_key = hkdf.derive(shared_secret, hkdf_salt, session_info, 32);
         local nonce = hkdf.derive(shared_secret, hkdf_salt, "nonce", 12);
         local cipher = ChaCha20.new(session_key, nonce);
@@ -367,7 +370,7 @@ particular protocol.
 ]]
 function broadcast(message, protocol)
     expect(2, protocol, "string", "nil")
-    send(CHANNEL_BROADCAST, message, protocol)
+    send(CHANNEL_BROADCAST, message, protocol, false)
 end
 
 --[[- Wait for a rednet message to be received, or until `timeout` seconds have
@@ -444,7 +447,7 @@ function receive(protocol_filter, timeout)
                     local received_mac = message:sub(13, 44);    -- Next 32 bytes are the MAC (BLAKE2s produces a 32-byte hash)
                     local received_ciphertext = message:sub(45); -- The rest is the ciphertext
 
-local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab4774284a3f5937bf77cf67713f349a8583905094865306c1fbb66c10bcfb089a932a297f1ed69965754d72078225cb8e6f34931303af0010e5d048680f076111d30ae449a325355ad3400190b664935bc0f9d2ab4e5468f6d97b928473b5fe2254d21b5fb"
+                    local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab4774284a3f5937bf77cf67713f349a8583905094865306c1fbb66c10bcfb089a932a297f1ed69965754d72078225cb8e6f34931303af0010e5d048680f076111d30ae449a325355ad3400190b664935bc0f9d2ab4e5468f6d97b928473b5fe2254d21b5fb"
 
                     local mac_info = "BLAKE2s MAC key";
                     local mac_key = hkdf.derive(shared_secret, hkdf_salt, mac_info, 32);
@@ -458,6 +461,7 @@ local hkdf_salt = "a12fb33f9fe20356eb7bb1a2f99ef81f1d6b279230aca44fbb152ab477428
 
                     local cipher = ChaCha20.new(session_key, received_nonce);
                     message = cipher:apply_keystream(received_ciphertext);
+                    return sender_id, message, protocol
                 end
 
                 return sender_id, message, protocol
@@ -679,6 +683,7 @@ end
 return {
     sendPublicKey = sendPublicKey,
     receivePublicKey = receivePublicKey,
+    getKeyFromStore = getKeyFromStore,
     open = open,
     close = close,
     isOpen = isOpen,
